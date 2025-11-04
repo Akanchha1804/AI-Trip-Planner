@@ -4,6 +4,7 @@ import Navbar from "./components/Navbar";
 import Home from "./pages/Home";
 import Planner from "./pages/Planner";
 import Results from "./pages/Results";
+import Booking from "./pages/booking";
 
 function App() {
     return ( <
@@ -21,6 +22,9 @@ function App() {
         /> <
         Route path = "/results"
         element = { < Results / > }
+        /> <
+        Route path = "/booking"
+        element = { < Booking / > }
         /> < /
         Routes > <
         /Router>
