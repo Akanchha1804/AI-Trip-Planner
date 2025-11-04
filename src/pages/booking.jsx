@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import "./Booking.css";
+import "./booking.css";
 import "@fortawesome/fontawesome-free/css/all.min.css";
 
 export default function Booking() {

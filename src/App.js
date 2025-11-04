@@ -5,6 +5,7 @@ import Home from "./pages/Home";
 import Planner from "./pages/Planner";
 import Results from "./pages/Results";
 import Booking from "./pages/booking";
+import Chatroom from "./pages/chatroom";
 
 function App() {
     return ( <
@@ -25,6 +26,9 @@ function App() {
         /> <
         Route path = "/booking"
         element = { < Booking / > }
+        /> <
+        Route path = "/chatroom"
+        element = { < Chatroom / > }
         /> < /
         Routes > <
         /Router>
