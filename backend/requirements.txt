@@ -5,3 +5,4 @@ openai
 googlemaps
 django-cors-headers
 python-dotenv
+google-generativeai

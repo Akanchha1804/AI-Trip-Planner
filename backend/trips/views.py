@@ -1,25 +1,77 @@
 from rest_framework import viewsets, status
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from .models import Trip, ChatRoom, Message
-from .serializers import TripSerializer, ChatRoomSerializer, MessageSerializer
+from rest_framework.authtoken.models import Token
+from django.contrib.auth import authenticate
+from .models import Trip, ChatRoom, Message, UserActivity, Booking, Destination
+from .serializers import TripSerializer, ChatRoomSerializer, MessageSerializer, UserSerializer, UserActivitySerializer, BookingSerializer, DestinationSerializer
 import openai
 from django.conf import settings
 import json
+import os
+import requests
+
+
 
 class TripViewSet(viewsets.ModelViewSet):
     queryset = Trip.objects.all()
     serializer_class = TripSerializer
+    permission_classes = [AllowAny]  # Allow anyone to create trips, but my_trips requires auth
+
+    def perform_create(self, serializer):
+        """Automatically assign the logged-in user when creating a trip"""
+        if self.request.user.is_authenticated:
+            serializer.save(user=self.request.user)
+        else:
+            serializer.save()
+    
+    def perform_update(self, serializer):
+        """Automatically assign the logged-in user when updating a trip (for Save Trip button)"""
+        if self.request.user.is_authenticated and not serializer.instance.user:
+            serializer.save(user=self.request.user)
+        else:
+            serializer.save()
+
+    def _get_user_context(self, session_id):
+        """Fetch user's past activity to provide context for AI"""
+        if not session_id:
+            return ""
+        
+        # Get last 5 activities from this session
+        past_activities = UserActivity.objects.filter(session_id=session_id).order_by('-created_at')[:5]
+        
+        if not past_activities.exists():
+            return ""
+        
+        context_parts = ["User's Recent Travel Interests:"]
+        for activity in past_activities:
+            context_parts.append(f"- Searched for {activity.destination_searched}")
+            if activity.preferences:
+                context_parts.append(f"  Preferences: {activity.preferences}")
+            if activity.budget_range:
+                context_parts.append(f"  Budget: {activity.budget_range}")
+        
+        return "\n".join(context_parts)
 
     @action(detail=True, methods=['post'])
     def generate_itinerary(self, request, pk=None):
         trip = self.get_object()
         
-        # Check if OpenAI key is valid (not placeholder)
-        api_key = getattr(settings, 'OPENAI_API_KEY', None)
-        use_openai = api_key and api_key != 'your_openai_key' and not api_key.startswith('your_')
+        # Check for API keys
+        openai_key = getattr(settings, 'OPENAI_API_KEY', None)
+        gemini_key = getattr(settings, 'GEMINI_API_KEY', None)
         
-        if not use_openai:
+        # Determine which AI to use
+        use_openai = openai_key and not openai_key.startswith('your_') and not openai_key.startswith('sk-placeholder')
+        use_gemini = gemini_key and not gemini_key.startswith('your_')
+        
+        print(f"DEBUG: Destination={trip.destination}")
+        print(f"DEBUG: OpenAI Key Present? {bool(use_openai)}")
+        print(f"DEBUG: Gemini Key Present? {bool(use_gemini)}")
+
+        if not use_openai and not use_gemini:
+            print("DEBUG: No valid API key found. Using Generic Fallback.")
             # Fallback mock itinerary
             # Destination-specific detailed itineraries (7+ days each)
             destination_itineraries = {
@@ -68,6 +120,33 @@ class TripViewSet(viewsets.ModelViewSet):
                     ("Spa & Wellness", ["Morning yoga session", "Traditional Balinese massage", "Healthy lunch at organic café", "Visit Campuhan Ridge Walk", "Meditation and sunset viewing"]),
                     ("Beach & Farewell", ["Morning at Nusa Dua beach", "Snorkeling or water sports", "Lunch at Jimbaran Bay", "Last-minute shopping", "Farewell seafood dinner on beach"])
                 ],
+                'Hong Kong': [
+                    ("Victoria Peak & Central", ["Take the Peak Tram to Victoria Peak", "Walk the Peak Circle Walk", "Star Ferry across Victoria Harbour", "Explore Central's skyscrapers", "Dinner in Lan Kwai Fong"]),
+                    ("Lantau Island", ["Cable car to Ngong Ping 360", "Visit the Tian Tan Buddha (Big Buddha)", "Explore Po Lin Monastery", "Visit Tai O fishing village", "Sunset at Cheung Sha Beach"]),
+                    ("Markets & Mong Kok", ["Visit the Ladies Market", "Explore the Goldfish Market", "Street food tour in Mong Kok", "Visit the Flower Market", "Dinner at a local Dai Pai Dong"]),
+                    ("Culture & History", ["Visit Man Mo Temple", "Explore Tai Kwun Centre for Heritage and Arts", "Ride the Central-Mid-Levels Escalator", "Visit Hong Kong Museum of History", "Evening Symphony of Lights show"]),
+                    ("Theme Park Day", ["Day trip to Hong Kong Disneyland OR Ocean Park", "Enjoy rides and attractions", "Watch parades and shows", "Dinner in the park", "Fireworks display"]),
+                    ("Islands & Beaches", ["Ferry to Lamma Island", "Seafood lunch at Sok Kwu Wan", "Hiking trail to Yung Shue Wan", "Relax at Hung Shing Yeh Beach", "Return ferry to Central"]),
+                    ("Shopping & Farewell", ["Shopping at Harbour City or Times Square", "High tea at The Peninsula", "Visit Sky100 Observation Deck", "Last dim sum meal", "Farewell drinks at Ozone Bar"])
+                ],
+                'Singapore': [
+                    ("Marina Bay & Gardens", ["Visit Gardens by the Bay (Cloud Forest & Flower Dome)", "Walk the OCBC Skyway", "Explore Marina Bay Sands", "Watch Spectra Light & Water Show", "Dinner at Satay by the Bay"]),
+                    ("Sentosa Island", ["Cable car to Sentosa", "Visit Universal Studios Singapore", "Relax at Siloso Beach", "Visit S.E.A. Aquarium", "Wings of Time night show"]),
+                    ("Culture & Heritage", ["Explore Chinatown and Buddha Tooth Relic Temple", "Lunch at Maxwell Food Centre (Chicken Rice)", "Visit Little India and Sri Veeramakaliamman Temple", "Explore Kampong Glam and Sultan Mosque", "Dinner in Haji Lane"]),
+                    ("Nature & Wildlife", ["Morning at Singapore Botanic Gardens (UNESCO)", "Visit the National Orchid Garden", "River Safari or Singapore Zoo", "Night Safari experience", "Dinner at the Zoo"]),
+                    ("Shopping & City", ["Shopping on Orchard Road", "Visit National Museum of Singapore", "Explore Fort Canning Park", "Clarke Quay boat quay", "Evening river cruise"]),
+                    ("Peranakan Culture", ["Visit Katong and Joo Chiat neighborhoods", "Try Peranakan cuisine (Laksa)", "Explore colorful shophouses", "Visit East Coast Park", "Seafood dinner at East Coast Lagoon"]),
+                    ("Jewel & Farewell", ["Visit Jewel Changi Airport", "See the Rain Vortex waterfall", "Shopping and dining at Jewel", "Canopy Park attractions", "Farewell meal"])
+                ],
+                'Sydney': [
+                    ("Iconic Sydney", ["Visit Sydney Opera House (tour or show)", "Walk across Sydney Harbour Bridge", "Explore The Rocks historic area", "Ferry to Manly Beach", "Dinner at Circular Quay"]),
+                    ("Bondi & Coastal Walk", ["Morning at Bondi Beach", "Do the Bondi to Coogee Coastal Walk", "Lunch at Coogee Pavilion", "Swim in an ocean pool", "Evening in Surry Hills"]),
+                    ("City & Culture", ["Visit Royal Botanic Garden", "Explore Art Gallery of New South Wales", "Shopping at Queen Victoria Building", "Visit Sydney Tower Eye", "Dinner in Darling Harbour"]),
+                    ("Wildlife & Nature", ["Ferry to Taronga Zoo", "Picnic with harbour views", "Visit Sea Life Sydney Aquarium", "Explore Barangaroo Reserve", "Sunset cruise on the harbour"]),
+                    ("Blue Mountains Day Trip", ["Day trip to Blue Mountains", "See the Three Sisters rock formation", "Ride Scenic World cable car", "Bushwalking in Wentworth Falls", "Return to Sydney evening"]),
+                    ("History & Markets", ["Visit Australian Museum", "Explore Paddy's Markets", "Lunch in Chinatown", "Visit Hyde Park Barracks", "Evening in Newtown"]),
+                    ("Relaxation & Farewell", ["Morning at Watsons Bay", "Fish and chips at Doyles", "Ferry back to city", "Last minute shopping", "Farewell dinner at Sydney Harbour"])
+                ],
                 'London': [
                     ("Royal London", ["Visit Buckingham Palace (Changing of Guard)", "Walk through St. James's Park", "Explore Westminster Abbey", "See Big Ben and Houses of Parliament", "Evening walk along South Bank"]),
                     ("Museums & Markets", ["Morning at British Museum", "Explore Covent Garden market", "Visit National Gallery in Trafalgar Square", "Walk through Leicester Square", "West End theatre show"]),
@@ -76,6 +155,42 @@ class TripViewSet(viewsets.ModelViewSet):
                     ("Camden & North London", ["Explore Camden Market", "Visit Regent's Park and Zoo", "Lunch in Primrose Hill", "Tour Abbey Road Studios area", "Evening in King's Cross"]),
                     ("Greenwich Day Trip", ["Visit Royal Observatory Greenwich", "Explore Greenwich Market", "See Cutty Sark ship", "Lunch with Thames view", "Return via Thames River cruise"]),
                     ("Shopping & Farewell", ["Morning at Harrods", "Explore Oxford Street shopping", "Visit Sky Garden for views", "Ride the London Eye", "Farewell dinner in Covent Garden"])
+                ],
+                'Kerala': [
+                    ("Arrival in Kochi", ["Arrive at Cochin Airport", "Check into Fort Kochi hotel", "Lunch at Kashi Art Café", "Explore Chinese Fishing Nets", "Dinner at Oceanos Restaurant", "Kathakali dance show"]),
+                    ("Munnar Tea Gardens", ["Drive to Munnar", "Lunch at Saravana Bhavan", "Visit Tata Tea Museum", "Tea plantation tour", "Dinner at Rapsy Restaurant"]),
+                    ("Thekkady Wildlife", ["Drive to Thekkady", "Periyar National Park boat safari", "Spice plantation tour", "Elephant experience", "Dinner at Grandma's Café"]),
+                    ("Alleppey Backwaters", ["Drive to Alleppey", "Check into houseboat", "Backwater cruise", "Village visit", "Traditional Kerala Sadhya dinner"]),
+                    ("Varkala Beach", ["Drive to Varkala", "Lunch at Clafouti Restaurant", "Beach relaxation", "Temple visit", "Dinner at Darjeeling Café"]),
+                    ("Ayurvedic Wellness", ["Sunrise photography", "Ayurvedic spa treatment", "Beach yoga", "Organic lunch", "Sunset meditation"]),
+                    ("Departure", ["Last shopping", "Trivandrum sightseeing", "Departure"])
+                ],
+                'Goa': [
+                    ("North Goa Beaches", ["Visit Baga Beach", "Water sports at Calangute", "Lunch at Brittos", "Sunset at Anjuna Beach", "Dinner at Thalassa"]),
+                    ("Old Goa Heritage", ["Basilica of Bom Jesus", "Se Cathedral", "Lunch at Fisherman's Wharf", "Fontainhas Latin Quarter walk", "Dinner cruise on Mandovi River"]),
+                    ("South Goa Relaxation", ["Palolem Beach", "Silent Noise Disco (if Saturday)", "Lunch at Dropadi", "Butterfly Beach boat ride", "Dinner at Martin's Corner"]),
+                    ("Spice Plantation", ["Visit Sahakari Spice Farm", "Traditional Goan lunch", "Elephant wash", "Dudhsagar Waterfalls trip", "Return to hotel"]),
+                    ("Adventure & Forts", ["Aguada Fort", "Chapora Fort (Dil Chahta Hai point)", "Lunch at Vinayak Family Restaurant", "Paragliding at Arambol", "Dinner at Gunpowder"]),
+                    ("Wellness & Markets", ["Morning Yoga", "Anjuna Flea Market (Wednesday) or Mapusa Market", "Lunch at Artjuna", "Sunset cruise", "Dinner at La Plage"]),
+                    ("Departure", ["Last dip in the sea", "Souvenir shopping", "Airport transfer"])
+                ],
+                'Jaipur': [
+                    ("Pink City Heritage", ["Hawa Mahal photo stop", "City Palace tour", "Jantar Mantar observatory", "Lunch at LMB", "Shopping in Johari Bazaar"]),
+                    ("Forts & Glory", ["Amber Fort elephant ride", "Jaigarh Fort", "Lunch at 1135 AD", "Nahargarh Fort sunset", "Dinner at Chokhi Dhani village resort"]),
+                    ("Royal Culture", ["Albert Hall Museum", "Birla Mandir", "Lunch at Tapri Central", "Patrika Gate photography", "Dinner at Handi"]),
+                    ("Departure", ["Breakfast at hotel", "Last minute shopping", "Departure"])
+                ],
+                'Mumbai': [
+                    ("Colaba & History", ["Gateway of India", "Taj Mahal Palace photo", "Colaba Causeway shopping", "Lunch at Leopold Cafe", "Chhatrapati Shivaji Maharaj Vastu Sangrahalaya"]),
+                    ("Marine Drive & Culture", ["Marine Drive walk", "Chowpatty Beach", "Lunch at Pizza by the Bay", "Haji Ali Dargah", "Dinner at Bademiya"]),
+                    ("Bandra & Bollywood", ["Bandra Bandstand", "Mount Mary Church", "Lunch at Candies", "Street art tour", "Dinner at Bastian"]),
+                    ("Departure", ["Juhu Beach morning", "Airport transfer"])
+                ],
+                'Delhi': [
+                    ("Old Delhi Charm", ["Red Fort", "Jama Masjid", "Rickshaw ride in Chandni Chowk", "Lunch at Karim's", "Raj Ghat"]),
+                    ("New Delhi Grandeur", ["India Gate", "Rashtrapati Bhavan drive-by", "Humayun's Tomb", "Lunch at Andhra Bhavan", "Qutub Minar"]),
+                    ("Spiritual & Modern", ["Lotus Temple", "Akshardham Temple", "Lunch at Fabcafe", "Hauz Khas Village", "Dinner at Social"]),
+                    ("Departure", ["Khan Market shopping", "Airport transfer"])
                 ]
             }
             
@@ -175,6 +290,42 @@ class TripViewSet(viewsets.ModelViewSet):
                     "Light rain jacket",
                     "Small daypack for excursions"
                 ],
+                'Hong Kong': [
+                    "Octopus card (for transport)",
+                    "Comfortable walking shoes (lots of hills)",
+                    "Light jacket (AC is strong indoors)",
+                    "Umbrella (sudden showers)",
+                    "Power adapter (Type G)",
+                    "Casual smart clothing",
+                    "Hand sanitizer/wipes",
+                    "Reusable water bottle",
+                    "Portable charger",
+                    "Camera for skyline shots"
+                ],
+                'Singapore': [
+                    "Light, breathable clothing (very humid)",
+                    "Comfortable sandals or sneakers",
+                    "Umbrella or poncho",
+                    "Sunscreen and sunglasses",
+                    "Insect repellent (for zoo/safari)",
+                    "Water bottle (tap water is safe)",
+                    "Power adapter (Type G)",
+                    "Light cardigan for malls",
+                    "Swimwear",
+                    "EZ-Link card holder"
+                ],
+                'Sydney': [
+                    "Sunscreen (very strong sun)",
+                    "Swimwear and beach towel",
+                    "Comfortable walking shoes",
+                    "Sunglasses and hat",
+                    "Light layers (weather changes)",
+                    "Power adapter (Type I)",
+                    "Opal card holder",
+                    "Flip flops (thongs)",
+                    "Casual beachwear",
+                    "Camera"
+                ],
                 'London': [
                     "Waterproof jacket or trench coat",
                     "Comfortable walking shoes (waterproof)",
@@ -218,42 +369,76 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.save()
             return Response({'status': 'itinerary generated', 'itinerary': trip.itinerary})
 
-        # Use OpenAI if key is valid
-        openai.api_key = api_key
-        
         try:
             days_count = (trip.end_date - trip.start_date).days + 1
+            
+            # Get user context for personalization
+            user_context = self._get_user_context(trip.session_id)
+            context_section = f"\n\nPERSONALIZATION CONTEXT:\n{user_context}\n" if user_context else ""
+            
             prompt = f"""
-            Generate a {days_count} day trip itinerary for {trip.destination} with a budget of ${trip.budget}.
-            Return ONLY a valid JSON object with the following structure:
+            Generate a detailed {days_count}-day trip itinerary for {trip.destination} with a budget of {trip.budget}.
+            {context_section}
+            REQUIREMENTS:
+            1. Use REAL, SPECIFIC restaurant names (e.g., "Lunch at Joe's Pizza", not "Lunch at a local spot").
+            2. Use REAL, SPECIFIC landmark names.
+            3. Include a "local_transportation" section describing the best way to get around (e.g., "Metro, Uber, Tuk-tuk").
+            4. If user context is provided, tailor recommendations based on their past preferences and interests.
+            
+            Return ONLY a valid JSON object with this EXACT structure:
             {{
                 "days": [
                     {{
                         "day": 1,
                         "title": "Theme of the day",
-                        "activities": ["Activity 1", "Activity 2", "Activity 3", "Activity 4"]
+                        "activities": [
+                            "9:00 AM - Visit [Specific Landmark]",
+                            "12:00 PM - Lunch at [Specific Restaurant]",
+                            "2:00 PM - Activity at [Specific Place]",
+                            "7:00 PM - Dinner at [Specific Restaurant]"
+                        ]
                     }}
                 ],
                 "packing_list": ["Item 1", "Item 2", "Item 3", "Item 4", "Item 5"],
-                "mood_board_keywords": ["Keyword 1", "Keyword 2", "Keyword 3"]
+                "mood_board_keywords": ["Keyword 1", "Keyword 2", "Keyword 3"],
+                "local_transportation": ["Option 1 (e.g. Metro)", "Option 2 (e.g. Taxi)", "Tip for getting around"]
             }}
             """
+
+            content = ""
             
-            response = openai.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful travel assistant that generates structured JSON itineraries."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            content = response.choices[0].message.content
+            if use_openai:
+                print("DEBUG: Attempting to generate with OpenAI...")
+                openai.api_key = openai_key
+                response = openai.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful travel assistant that generates structured JSON itineraries."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                content = response.choices[0].message.content
+                
+            elif use_gemini:
+                print("DEBUG: Attempting to generate with Google Gemini...")
+                import google.generativeai as genai
+                genai.configure(api_key=gemini_key)
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content(prompt)
+                content = response.text
+                # Clean up markdown code blocks if Gemini adds them
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.endswith('```'):
+                    content = content[:-3]
+
+            print("DEBUG: AI Generation Successful!")
             trip.itinerary = content
             trip.save()
             return Response({'status': 'itinerary generated', 'itinerary': content})
             
         except Exception as e:
-            print(f"OpenAI Error: {e}")
+            print(f"DEBUG: AI Error: {e}")
             # Fallback to mock on error
             mock_itinerary = {
                 "days": [
@@ -269,6 +454,89 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.itinerary = json.dumps(mock_itinerary)
             trip.save()
             return Response({'status': 'itinerary generated (fallback)', 'itinerary': trip.itinerary})
+
+    @action(detail=True, methods=['post'])
+    def refine_itinerary(self, request, pk=None):
+        trip = self.get_object()
+        user_instruction = request.data.get('instruction')
+        
+        if not user_instruction:
+            return Response({'error': 'Instruction is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check for API keys
+        openai_key = getattr(settings, 'OPENAI_API_KEY', None)
+        gemini_key = getattr(settings, 'GEMINI_API_KEY', None)
+        
+        use_openai = openai_key and not openai_key.startswith('your_') and not openai_key.startswith('sk-placeholder')
+        use_gemini = gemini_key and not gemini_key.startswith('your_')
+
+        if not use_openai and not use_gemini:
+            # Fallback: Return helpful message without AI
+            return Response({
+                'status': 'refinement_unavailable',
+                'message': f'AI refinement requires an API key. Your request: "{user_instruction}" has been noted. To enable AI-powered refinement, please configure OpenAI or Gemini API key in settings.py.',
+                'itinerary': trip.itinerary,
+                'suggestion': 'You can manually regenerate the itinerary or use the current one.'
+            }, status=status.HTTP_200_OK)
+
+        try:
+            days_count = (trip.end_date - trip.start_date).days + 1
+            current_itinerary = trip.itinerary
+            
+            prompt = f"""
+            Refine the following {days_count}-day trip itinerary for {trip.destination} based on this user instruction: "{user_instruction}".
+            
+            Current Itinerary JSON:
+            {current_itinerary}
+            
+            REQUIREMENTS:
+            1. Keep the JSON structure EXACTLY the same.
+            2. Modify activities/restaurants based on the instruction.
+            3. Return ONLY valid JSON.
+            """
+
+            content = ""
+            
+            if use_openai:
+                openai.api_key = openai_key
+                response = openai.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful travel assistant that modifies structured JSON itineraries."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                content = response.choices[0].message.content
+                
+            elif use_gemini:
+                import google.generativeai as genai
+                genai.configure(api_key=gemini_key)
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content(prompt)
+                content = response.text
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.endswith('```'):
+                    content = content[:-3]
+
+            trip.itinerary = content
+            trip.save()
+            return Response({'status': 'itinerary refined', 'itinerary': content})
+            
+        except Exception as e:
+            print(f"Refinement Error: {e}")
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_trips(self, request):
+        """
+        GET /api/trips/my_trips/
+        Returns only the trips that belong to the logged-in user.
+        """
+        user = request.user
+        trips = Trip.objects.filter(user=user).order_by('-created_at')
+        serializer = self.get_serializer(trips, many=True)
+        return Response(serializer.data)
 
 class ChatRoomViewSet(viewsets.ModelViewSet):
     queryset = ChatRoom.objects.all()
@@ -295,3 +563,125 @@ class ChatRoomViewSet(viewsets.ModelViewSet):
                 serializer.save(room=room)
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserActivityViewSet(viewsets.ModelViewSet):
+    """Track user search activities for AI personalization"""
+    queryset = UserActivity.objects.all()
+    serializer_class = UserActivitySerializer
+    permission_classes = [AllowAny]
+    
+    def create(self, request, *args, **kwargs):
+        """Log user activity"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class BookingViewSet(viewsets.ModelViewSet):
+    """Handle bookings for flights, hotels, buses, trains"""
+    queryset = Booking.objects.all()
+    serializer_class = BookingSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return only bookings for the logged-in user"""
+        return Booking.objects.filter(user=self.request.user)
+    
+    def create(self, request, *args, **kwargs):
+        """
+        POST /api/bookings/
+        Expected payload:
+        {
+            "trip": <trip_id>,
+            "provider": "flight" | "hotel" | "bus" | "train",
+            "payload": { ... provider-specific data ... }
+        }
+        """
+        user = request.user
+        trip_id = request.data.get('trip')
+        provider = request.data.get('provider')
+        payload = request.data.get('payload', {})
+        
+        # Validate trip exists and belongs to user
+        try:
+            trip = Trip.objects.get(id=trip_id)
+        except Trip.DoesNotExist:
+            return Response(
+                {'error': 'Trip not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Choose external API endpoint based on provider
+        provider_urls = {
+            'flight': 'https://api.example.com/flight/book',
+            'hotel': 'https://api.example.com/hotel/book',
+            'bus': 'https://api.example.com/bus/book',
+            'train': 'https://api.example.com/train/book',
+        }
+        
+        external_url = provider_urls.get(provider)
+        if not external_url:
+            return Response(
+                {'error': 'Unsupported provider. Choose: flight, hotel, bus, or train'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # For demo purposes, create a mock successful booking
+        # In production, you would call the actual external API:
+        # try:
+        #     external_resp = requests.post(
+        #         external_url,
+        #         json=payload,
+        #         timeout=15,
+        #         headers={'Content-Type': 'application/json'}
+        #     )
+        #     external_resp.raise_for_status()
+        #     external_data = external_resp.json()
+        # except requests.RequestException as exc:
+        #     return Response(
+        #         {'error': f'Booking provider error: {str(exc)}'},
+        #         status=status.HTTP_502_BAD_GATEWAY
+        #     )
+        
+        # Mock response for demo
+        import uuid
+        external_data = {
+            'booking_id': f'{provider.upper()}-{uuid.uuid4().hex[:8].upper()}',
+            'status': 'confirmed',
+            'provider': provider,
+            'details': payload
+        }
+        
+        # Create booking record
+        booking = Booking.objects.create(
+            user=user,
+            trip=trip,
+            provider=provider,
+            reference_id=external_data.get('booking_id'),
+            status=external_data.get('status', 'confirmed'),
+            raw_response=external_data
+        )
+        
+        serializer = self.get_serializer(booking)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def signup(request):
+    serializer = UserSerializer(data=request.data)
+    if serializer.is_valid():
+        user = serializer.save()
+        token, created = Token.objects.get_or_create(user=user)
+        return Response({'token': token.key, 'user': serializer.data})
+    return Response(serializer.errors, status=400)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+    user = authenticate(username=username, password=password)
+    if not user:
+        return Response({'error': 'Invalid Credentials'}, status=400)
+    token, created = Token.objects.get_or_create(user=user)
+    return Response({'token': token.key, 'username': user.username})
