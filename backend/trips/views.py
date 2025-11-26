@@ -665,6 +665,35 @@ class BookingViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(booking)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+class DestinationViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for moodboard destinations with filtering
+    """
+    queryset = Destination.objects.all()
+    serializer_class = DestinationSerializer
+    permission_classes = [AllowAny]  # Allow public access to moodboard
+    
+    def get_queryset(self):
+        queryset = Destination.objects.all()
+        
+        # Filter by trip type
+        trip_type = self.request.query_params.get('trip_type', None)
+        if trip_type:
+            queryset = queryset.filter(trip_types__icontains=trip_type)
+            
+        # Filter by region
+        region = self.request.query_params.get('region', None)
+        if region:
+            queryset = queryset.filter(region__iexact=region)
+            
+        # Filter by activity
+        activity = self.request.query_params.get('activity', None)
+        if activity:
+            queryset = queryset.filter(activities__icontains=activity)
+            
+        return queryset.order_by('name')
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def signup(request):
